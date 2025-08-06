@@ -2009,29 +2009,217 @@ resource "aws_cloudfront_distribution" "main" {
       sysctl:
         name: "{{ item.key }}"
         value: "{{ item.value }}"
-        sysctl.conf file and reload
+        sysctl_set: yes
+        state: present
         reload: yes
       loop:
         - { key: 'net.ipv4.ip_forward', value: '0' }
         - { key: 'net.ipv4.conf.all.send_redirects', value: '0' }
         - { key: 'net.ipv4.conf.default.send_redirects', value: '0' }
-        - { key: 'net.ipv4.conf.all.accept_source_route', value: '0' }
-        - { key: 'net.ipv4.conf.default.accept_source_route', value: '0' }
         - { key: 'net.ipv4.conf.all.accept_redirects', value: '0' }
         - { key: 'net.ipv4.conf.default.accept_redirects', value: '0' }
-        - { key: 'net.ipv4.conf.all.secure_redirects', value: '0' }
-        - { key: 'net.ipv4.conf.default.secure_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_source_route', value: '0' }
         - { key: 'net.ipv4.conf.all.log_martians', value: '1' }
         - { key: 'net.ipv4.conf.default.log_martians', value: '1' }
         - { key: 'net.ipv4.icmp_echo_ignore_broadcasts', value: '1' }
         - { key: 'net.ipv4.icmp_ignore_bogus_error_responses', value: '1' }
         - { key: 'net.ipv4.tcp_syncookies', value: '1' }
+        - { key: 'kernel.dmesg_restrict', value: '1' }
+        - { key: 'kernel.kptr_restrict', value: '2' }
+        - { key: 'kernel.yama.ptrace_scope', value: '1' }
+
+    - name: Disable unused network protocols
+      lineinfile:
+        path: /etc/modprobe.d/blacklist.conf
+        line: "install {{ item }} /bin/true"
+        create: yes
+      loop:
+        - dccp
+        - sctp
+        - rds
+        - tipc
+
+    - name: Configure SSH hardening
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backup: yes
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?AuthorizedKeysFile', line: 'AuthorizedKeysFile .ssh/authorized_keys' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+        - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+        - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+        - { regexp: '^#?LoginGraceTime', line: 'LoginGraceTime 60' }
+        - { regexp: '^#?AllowUsers', line: 'AllowUsers {{ ansible_user }}' }
+        - { regexp: '^#?Protocol', line: 'Protocol 2' }
+        - { regexp: '^#?LogLevel', line: 'LogLevel VERBOSE' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxStartups', line: 'MaxStartups 10:30:60' }
+        - { regexp: '^#?Banner', line: 'Banner /etc/issue.net' }
+      notify: restart sshd
+
+    - name: Create security banner
+      copy:
+        content: |
+          ***************************************************************************
+                                   NOTICE TO USERS
+          
+          This computer system is the private property of its owner, whether
+          individual, corporate or government.  It is for authorized use only.
+          Users (authorized or unauthorized) have no explicit or implicit
+          expectation of privacy.
+          
+          Any or all uses of this system and all files on this system may be
+          intercepted, monitored, recorded, copied, audited, inspected, and
+          disclosed to your employer, to authorized site, government, and law
+          enforcement personnel, as well as authorized officials of government
+          agencies, both domestic and foreign.
+          
+          By using this system, the user consents to such interception, monitoring,
+          recording, copying, auditing, inspection, and disclosure at the
+          discretion of such personnel or officials.  Unauthorized or improper use
+          of this system may result in civil and criminal penalties and
+          administrative or disciplinary action, as appropriate. By continuing to
+          use this system you indicate your awareness of and consent to these terms
+          and conditions of use. LOG OFF IMMEDIATELY if you do not agree to the
+          conditions stated in this warning.
+          
+          ****************************************************************************
+        dest: /etc/issue.net
+
+    - name: Configure auditd
+      template:
+        src: audit.rules.j2
+        dest: /etc/audit/rules.d/audit.rules
+      notify: restart auditd
+
+    - name: Enable and start security services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - fail2ban
+        - ufw
+        - auditd
+
+    - name: Configure log rotation
+      copy:
+        content: |
+          /var/log/auth.log
+          /var/log/kern.log
+          /var/log/mail.log
+          /var/log/user.log
+          {
+              weekly
+              missingok
+              rotate 52
+              compress
+              delaycompress
+              notifempty
+              postrotate
+                  /usr/lib/rsyslog/rsyslog-rotate
+              endscript
+          }
+        dest: /etc/logrotate.d/security-logs
+
+    - name: Set up intrusion detection
+      copy:
+        content: |
+          #!/bin/bash
+          # Simple intrusion detection script
+          
+          # Check for failed SSH attempts
+          FAILED_SSH=$(grep "Failed password" /var/log/auth.log | tail -20)
+          if [ ! -z "$FAILED_SSH" ]; then
+              echo "Recent failed SSH attempts detected:"
+              echo "$FAILED_SSH"
+          fi
+          
+          # Check for new users
+          CURRENT_USERS=$(cut -d: -f1 /etc/passwd | sort)
+          if [ -f /var/log/baseline_users ]; then
+              NEW_USERS=$(comm -13 /var/log/baseline_users <(echo "$CURRENT_USERS"))
+              if [ ! -z "$NEW_USERS" ]; then
+                  echo "New users detected: $NEW_USERS"
+              fi
+          else
+              echo "$CURRENT_USERS" > /var/log/baseline_users
+          fi
+          
+          # Check for unusual processes
+          ps aux --sort=-%cpu | head -10
+        dest: /usr/local/bin/intrusion-check
+        mode: '0755'
+
+    - name: Schedule intrusion detection
+      cron:
+        name: "Intrusion Detection Check"
+        minute: "0"
+        hour: "*/4"
+        job: "/usr/local/bin/intrusion-check >> /var/log/intrusion-check.log 2>&1"
 
   handlers:
     - name: restart fail2ban
-      service:
+      systemd:
         name: fail2ban
         state: restarted
+
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: restart auditd
+      systemd:
+        name: auditd
+        state: restarted
+
+# ansible/templates/audit.rules.j2
+# Audit rules template
+-D
+-b 8192
+
+# Monitor authentication events
+-w /var/log/auth.log -p wa -k auth
+-w /etc/passwd -p wa -k passwd_changes
+-w /etc/group -p wa -k group_changes
+-w /etc/shadow -p wa -k shadow_changes
+-w /etc/sudoers -p wa -k sudoers_changes
+
+# Monitor network configuration
+-w /etc/network/ -p wa -k network_changes
+-w /etc/hosts -p wa -k network_changes
+-w /etc/hostname -p wa -k network_changes
+
+# Monitor system configuration
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/cron.allow -p wa -k cron_changes
+-w /etc/cron.deny -p wa -k cron_changes
+-w /etc/cron.d/ -p wa -k cron_changes
+-w /etc/cron.daily/ -p wa -k cron_changes
+-w /etc/cron.hourly/ -p wa -k cron_changes
+-w /etc/cron.monthly/ -p wa -k cron_changes
+-w /etc/cron.weekly/ -p wa -k cron_changes
+-w /etc/crontab -p wa -k cron_changes
+
+# Monitor file system changes
+-w /etc/fstab -p wa -k fstab_changes
+-w /etc/mtab -p wa -k mount_changes
+
+# Monitor kernel module changes
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+
+# Enable audit
+-e 1
 ```
 
 ## Where Jenkins and Ngrok Fit in Complete Workflows
@@ -2041,7 +2229,7 @@ resource "aws_cloudfront_distribution" "main" {
 **Universal CI/CD Orchestrator Role:**
 Jenkins acts as the central automation hub that coordinates deployments across all platforms and methods, regardless of the target deployment approach.
 
-#### **Jenkins + PaaS Integration Pattern:**
+#### **Jenkins + PaaS Integration Pattern(Render/Vercel):**
 ```groovy
 stage('Deploy to PaaS') {
     parallel {
